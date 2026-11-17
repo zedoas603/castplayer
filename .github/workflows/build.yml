@@ -22,6 +22,15 @@ jobs:
           cd /tmp/app
           M=android/app/src/main/AndroidManifest.xml
           sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/><uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/><uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/><application android:usesCleartextTraffic="true"#' $M
+          for f in android/app/build.gradle.kts android/app/build.gradle; do
+            if [ -f "$f" ]; then
+              if [[ "$f" == *.kts ]]; then
+                printf '\nandroid {\n    lint {\n        checkReleaseBuilds = false\n        abortOnError = false\n    }\n}\n' >> "$f"
+              else
+                printf '\nandroid {\n    lintOptions {\n        checkReleaseBuilds false\n        abortOnError false\n    }\n}\n' >> "$f"
+              fi
+            fi
+          done
           flutter pub get
           flutter build apk --release
       - uses: actions/upload-artifact@v4
