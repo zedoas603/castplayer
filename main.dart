@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dlna.dart';
 import 'browser.dart';
@@ -98,11 +99,36 @@ class _HomeState extends State<Home> {
   @override
   void initState() {
     super.initState();
+    _ch.setMethodCallHandler((call) async {
+      if (call.method == 'onUrl') _incoming(call.arguments);
+    });
+    _ch.invokeMethod('getInitial').then(_incoming).catchError((_) {});
     SharedPreferences.getInstance().then((p) {
       final s = p.getString('links');
       if (s != null) setState(() => links = List<Map<String, dynamic>>.from(jsonDecode(s)));
+      if (p.getBool('in_browser') == true) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _openBrowser();
+        });
+      }
     });
   }
+
+  static const _ch = MethodChannel('castplayer/intent');
+
+  // A link sent from another app (Open with / Share) is cast straight away.
+  void _incoming(dynamic m) {
+    if (m is! Map) return;
+    final url = m['url']?.toString();
+    if (url == null || url.isEmpty) return;
+    final title = (m['title'] ?? '').toString();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _castUrl(url, title.isEmpty ? url : title);
+    });
+  }
+
+  void _openBrowser() => Navigator.push(context,
+      MaterialPageRoute(builder: (_) => Browser(t: widget.t, onCast: _castUrl)));
 
   Future<void> _save() async =>
       (await SharedPreferences.getInstance()).setString('links', jsonEncode(links));
@@ -163,10 +189,7 @@ class _HomeState extends State<Home> {
       appBar: AppBar(title: Text(t['title']!), actions: [
         IconButton(
             icon: const Icon(Icons.search),
-            onPressed: () => Navigator.push(
-                context,
-                MaterialPageRoute(
-                    builder: (_) => Browser(t: widget.t, onCast: _castUrl)))),
+            onPressed: _openBrowser),
         IconButton(icon: const Icon(Icons.language), onPressed: widget.onToggle)
       ]),
       floatingActionButton: FloatingActionButton(onPressed: _add, child: const Icon(Icons.add)),

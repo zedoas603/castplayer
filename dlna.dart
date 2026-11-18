@@ -6,6 +6,33 @@ import 'package:http/http.dart' as http;
 const _av = 'urn:schemas-upnp-org:service:AVTransport:1';
 const _rc = 'urn:schemas-upnp-org:service:RenderingControl:1';
 
+class DlnaError implements Exception {
+  final int? code;
+  final String desc;
+  final int http;
+  DlnaError(this.code, this.desc, this.http);
+
+  String get hint {
+    switch (code) {
+      case 714:
+        return 'صيغة الفيديو غير مدعومة في التلفزيون';
+      case 716:
+        return 'التلفزيون لم يستطع فتح الرابط (غالبًا محمي بـ headers أو مرتبط بجهازك أو https)';
+      case 701:
+      case 715:
+        return 'التلفزيون مشغول، جرّب مرة أخرى';
+      case 402:
+        return 'الرابط غير مقبول للتلفزيون';
+      default:
+        return 'التلفزيون رفض الأمر';
+    }
+  }
+
+  @override
+  String toString() =>
+      '$hint [HTTP $http${code != null ? ' / UPnP $code' : ''}${desc.isNotEmpty ? ' $desc' : ''}]';
+}
+
 class Renderer {
   final String name;
   final String? avUrl;
@@ -101,27 +128,75 @@ class Dlna {
             },
             body: body)
         .timeout(const Duration(seconds: 10));
-    if (r.statusCode >= 300) throw Exception('HTTP ${r.statusCode}');
-    return utf8.decode(r.bodyBytes, allowMalformed: true);
+    final text = utf8.decode(r.bodyBytes, allowMalformed: true);
+    if (r.statusCode >= 300) {
+      final code = int.tryParse(
+          RegExp(r'<errorCode>(\d+)</errorCode>').firstMatch(text)?.group(1) ?? '');
+      final desc =
+          RegExp(r'<errorDescription>(.*?)</errorDescription>').firstMatch(text)?.group(1) ?? '';
+      throw DlnaError(code, desc, r.statusCode);
+    }
+    return text;
   }
 
+  static String _mimeFor(String url) {
+    final u = url.toLowerCase();
+    if (u.contains('.m3u8')) return 'application/vnd.apple.mpegurl';
+    if (u.contains('.mpd')) return 'application/dash+xml';
+    if (u.contains('.webm')) return 'video/webm';
+    if (u.contains('.mkv')) return 'video/x-matroska';
+    return 'video/mp4';
+  }
+
+  static String _didl(String url, String title, String protocolInfo) =>
+      '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+      'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+      'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+      '<item id="0" parentID="-1" restricted="1"><dc:title>${esc(title)}</dc:title>'
+      '<upnp:class>object.item.videoItem</upnp:class>'
+      '<res protocolInfo="$protocolInfo">${esc(url)}</res></item></DIDL-Lite>';
+
+  /// Tries several combinations (metadata variants, https->http) until the TV accepts.
   static Future<void> cast(Renderer r, String url, String title) async {
-    final mime = url.contains('.m3u8')
-        ? 'application/vnd.apple.mpegurl'
-        : 'video/mp4';
-    final didl = '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
-        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
-        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
-        '<item id="0" parentID="-1" restricted="1"><dc:title>${esc(title)}</dc:title>'
-        '<upnp:class>object.item.videoItem</upnp:class>'
-        '<res protocolInfo="http-get:*:$mime:*">${esc(url)}</res></item></DIDL-Lite>';
     try {
       await _soap(r.avUrl!, _av, 'Stop', '<InstanceID>0</InstanceID>');
     } catch (_) {}
-    await _soap(r.avUrl!, _av, 'SetAVTransportURI',
-        '<InstanceID>0</InstanceID><CurrentURI>${esc(url)}</CurrentURI>'
-        '<CurrentURIMetaData>${esc(didl)}</CurrentURIMetaData>');
-    await play(r);
+    final urls = <String>[url];
+    if (url.startsWith('https://')) urls.add('http://${url.substring(8)}');
+    final mime = _mimeFor(url);
+    DlnaError? first;
+    Object? last;
+    for (final u in urls) {
+      final metas = [
+        _didl(u, title, 'http-get:*:$mime:*'),
+        _didl(u, title, 'http-get:*:*:*'),
+        '',
+      ];
+      for (final m in metas) {
+        try {
+          await _soap(
+              r.avUrl!,
+              _av,
+              'SetAVTransportURI',
+              '<InstanceID>0</InstanceID><CurrentURI>${esc(u)}</CurrentURI>'
+              '<CurrentURIMetaData>${esc(m)}</CurrentURIMetaData>');
+          await Future.delayed(const Duration(milliseconds: 400));
+          for (var i = 0; i < 3; i++) {
+            try {
+              await play(r);
+              return;
+            } on DlnaError catch (e) {
+              if (i == 2 || (e.code != 701 && e.code != 715)) rethrow;
+              await Future.delayed(const Duration(milliseconds: 800));
+            }
+          }
+        } catch (e) {
+          last = e;
+          if (e is DlnaError) first ??= e;
+        }
+      }
+    }
+    throw first ?? last ?? Exception('cast failed');
   }
 
   static Future<void> play(Renderer r) => _soap(r.avUrl!, _av, 'Play',

@@ -169,6 +169,16 @@ final _media = RegExp(r'\.(m3u8|mpd|mp4|webm|mkv)(\?|#|$)|\.m3u8', caseSensitive
 const _ua =
     'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
 
+class _Meta {
+  final String label;
+  final int prio; // 0 master, 1 live, 2 vod, 3 unverified
+  _Meta(this.label, this.prio);
+}
+
+final _adLike = RegExp(
+    r'(^|[/._=?&-])(ads?|adv|adserver|advert\w*|vast|vpaid|preroll|midroll|postroll|banner|sponsor|imasdk|doubleclick|promo|tracking|pixel)([/._=?&-]|$)',
+    caseSensitive: false);
+
 class _Tab {
   final int id;
   final bool incognito;
@@ -176,6 +186,9 @@ class _Tab {
   String url;
   String title = '';
   final found = <String>[];
+  final seen = <String>{};
+  final meta = <String, _Meta>{};
+  bool loaded = false;
   _Tab(this.id, this.incognito, this.url);
 }
 
@@ -189,9 +202,9 @@ class Browser extends StatefulWidget {
   State<Browser> createState() => _BrowserState();
 }
 
-class _BrowserState extends State<Browser> {
+class _BrowserState extends State<Browser> with WidgetsBindingObserver {
   final tabs = <_Tab>[];
-  int cur = 0, _nid = 0;
+  int cur = 0, _nid = 0, _lastIdx = 0;
   final tc = TextEditingController();
   bool adblock = true, ready = false, dirty = false;
   int blocked = 0;
@@ -206,13 +219,34 @@ class _BrowserState extends State<Browser> {
   void initState() {
     super.initState();
     AdGuard.init();
+    WidgetsBinding.instance.addObserver(this);
     SharedPreferences.getInstance().then((p) {
       if (!mounted) return;
+      if (p.getBool('inc_active') == true) _wipeIncognito();
       setState(() {
         adblock = p.getBool('adblock') ?? true;
-        tabs.add(_Tab(_nid++, false, _home));
+        final saved = p.getString('tabs');
+        if (saved != null) {
+          try {
+            final m = jsonDecode(saved);
+            for (final e in (m['tabs'] as List)) {
+              final t = _Tab(_nid++, false, e['u'].toString());
+              t.title = (e['t'] ?? '').toString();
+              tabs.add(t);
+            }
+            if (tabs.isNotEmpty) {
+              cur = ((m['cur'] ?? 0) as int).clamp(0, tabs.length - 1).toInt();
+              _lastIdx = cur;
+            }
+          } catch (_) {
+            tabs.clear();
+          }
+        }
+        if (tabs.isEmpty) tabs.add(_Tab(_nid++, false, _home));
+        tc.text = tab.url;
         ready = true;
       });
+      p.setBool('in_browser', true);
     });
     timer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (dirty && mounted) {
@@ -224,8 +258,48 @@ class _BrowserState extends State<Browser> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     timer?.cancel();
+    _saveTabs();
+    if (tabs.any((t) => t.incognito)) _wipeIncognito();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused) _saveTabs();
+  }
+
+  /// Saves only normal (non-incognito) tabs, so the last page is restored next time.
+  Future<void> _saveTabs() async {
+    final normals = tabs.where((t) => !t.incognito).toList();
+    if (normals.isEmpty) return;
+    var idx = (tabs.isNotEmpty && cur < tabs.length && !tabs[cur].incognito)
+        ? normals.indexOf(tabs[cur])
+        : _lastIdx;
+    if (idx < 0) idx = 0;
+    _lastIdx = idx;
+    final p = await SharedPreferences.getInstance();
+    await p.setString(
+        'tabs',
+        jsonEncode({
+          'cur': idx,
+          'tabs': [
+            for (final t in normals) {'u': t.url, 't': t.title}
+          ],
+        }));
+  }
+
+  /// Wipes cookies, site storage and cache left behind by incognito browsing.
+  Future<void> _wipeIncognito() async {
+    try {
+      await CookieManager.instance().deleteAllCookies();
+      await WebStorageManager.instance().deleteAllData();
+      await InAppWebViewController.clearAllCache();
+    } catch (_) {}
+    try {
+      (await SharedPreferences.getInstance()).setBool('inc_active', false);
+    } catch (_) {}
   }
 
   List<UserScript> _scripts() => [
@@ -240,11 +314,59 @@ class _BrowserState extends State<Browser> {
               forMainFrameOnly: false),
       ];
 
-  void _addFound(_Tab tb, String u) {
-    if (!mounted || tb.found.contains(u)) return;
+  String _dur(double sec) {
+    final m = sec ~/ 60, x = sec.toInt() % 60;
+    final h = m ~/ 60;
+    String two(int n) => n.toString().padLeft(2, '0');
+    return h > 0 ? '$h:${two(m % 60)}:${two(x)}' : '${two(m)}:${two(x)}';
+  }
+
+  /// Returns null when the link looks like an ad (short clip / tiny file / error page).
+  Future<_Meta?> _probe(String u) async {
+    final lu = u.toLowerCase();
+    try {
+      if (lu.contains('.m3u8')) {
+        final r = await http
+            .get(Uri.parse(u), headers: {'User-Agent': _ua})
+            .timeout(const Duration(seconds: 6));
+        if (r.statusCode != 200) return _Meta('', 3);
+        final b = r.body;
+        if (!b.contains('#EXTM3U')) return null;
+        if (b.contains('#EXT-X-STREAM-INF')) {
+          return _Meta(_s('جودات متعددة (الأفضل)', 'Multi-quality (best)'), 0);
+        }
+        var total = 0.0;
+        for (final m in RegExp(r'#EXTINF:([\d.]+)').allMatches(b)) {
+          total += double.tryParse(m.group(1)!) ?? 0;
+        }
+        if (!b.contains('#EXT-X-ENDLIST')) return _Meta(_s('بث مباشر', 'Live'), 1);
+        if (total < 90) return null;
+        return _Meta('${_s('فيديو', 'Video')} ${_dur(total)}', 2);
+      }
+      if (RegExp(r'\.(mp4|webm|mkv)').hasMatch(lu)) {
+        final r = await http
+            .head(Uri.parse(u), headers: {'User-Agent': _ua})
+            .timeout(const Duration(seconds: 6));
+        final len = int.tryParse(r.headers['content-length'] ?? '');
+        if (r.statusCode < 400 && len != null && len < 3 * 1024 * 1024) return null;
+        if (len != null) {
+          return _Meta('${_s('فيديو', 'Video')} ${(len / 1048576).toStringAsFixed(0)} MB', 2);
+        }
+      }
+    } catch (_) {}
+    return _Meta('', 3);
+  }
+
+  void _addFound(_Tab tb, String u) async {
+    if (!mounted || tb.seen.contains(u)) return;
+    tb.seen.add(u);
+    if (_adLike.hasMatch(u)) return;
+    final m = await _probe(u);
+    if (m == null || !mounted) return;
     setState(() {
       if (tb.found.length >= 40) tb.found.removeAt(0);
       tb.found.add(u);
+      tb.meta[u] = m;
     });
   }
 
@@ -268,6 +390,11 @@ class _BrowserState extends State<Browser> {
       cur = tabs.length - 1;
     });
     tc.text = url;
+    if (incognito) {
+      SharedPreferences.getInstance().then((p) => p.setBool('inc_active', true));
+    } else {
+      _saveTabs();
+    }
   }
 
   void _closeTab(int i) {
@@ -285,6 +412,8 @@ class _BrowserState extends State<Browser> {
       }
     });
     tc.text = tab.url;
+    _saveTabs();
+    if (t.incognito && !tabs.any((x) => x.incognito)) _wipeIncognito();
   }
 
   void _toggleAdblock() async {
@@ -327,9 +456,11 @@ class _BrowserState extends State<Browser> {
                           style: const TextStyle(fontWeight: FontWeight.bold))),
                   if (tb.found.isEmpty)
                     Padding(padding: const EdgeInsets.all(24), child: Text(t['nofound']!)),
-                  for (final u in tb.found.reversed)
+                  for (final u in ([...tb.found]
+                    ..sort((a, b) => (tb.meta[a]?.prio ?? 3).compareTo(tb.meta[b]?.prio ?? 3))))
                     ListTile(
                       title: Text(u, maxLines: 2, overflow: TextOverflow.ellipsis),
+                      subtitle: (tb.meta[u]?.label ?? '').isEmpty ? null : Text(tb.meta[u]!.label),
                       trailing: const Icon(Icons.cast),
                       onLongPress: () => Clipboard.setData(ClipboardData(text: u)),
                       onTap: () async {
@@ -389,6 +520,7 @@ class _BrowserState extends State<Browser> {
                               Navigator.pop(ctx);
                               setState(() => cur = i);
                               tc.text = tb.url;
+                              _saveTabs();
                             },
                             trailing: IconButton(
                                 icon: const Icon(Icons.close),
@@ -419,6 +551,7 @@ class _BrowserState extends State<Browser> {
         mediaPlaybackRequiresUserGesture: false,
         allowsInlineMediaPlayback: true,
         cacheEnabled: !tb.incognito,
+        incognito: tb.incognito,
         mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
         userAgent: _ua,
       ),
@@ -477,6 +610,8 @@ class _BrowserState extends State<Browser> {
       },
       onLoadStart: (ctl, url) {
         tb.found.clear();
+        tb.seen.clear();
+        tb.meta.clear();
         if (url != null && _media.hasMatch(url.toString())) _addFound(tb, url.toString());
         if (mounted) setState(() {});
       },
@@ -484,7 +619,10 @@ class _BrowserState extends State<Browser> {
         if (url == null) return;
         tb.url = url.toString();
         tb.title = await ctl.getTitle() ?? '';
-        if (!tb.incognito) _addHistory(tb.title, tb.url);
+        if (!tb.incognito) {
+          _addHistory(tb.title, tb.url);
+          _saveTabs();
+        }
         if (!mounted) return;
         if (identical(tb, tab)) tc.text = tb.url;
         setState(() {});
@@ -500,6 +638,7 @@ class _BrowserState extends State<Browser> {
   @override
   Widget build(BuildContext context) {
     final t = widget.t;
+    if (ready) tab.loaded = true;
     final foundCount = ready ? tab.found.length : 0;
     return PopScope(
       canPop: false,
@@ -508,7 +647,9 @@ class _BrowserState extends State<Browser> {
         if (ready && tab.c != null && await tab.c!.canGoBack()) {
           tab.c!.goBack();
         } else if (mounted) {
-          Navigator.pop(context);
+          await _saveTabs();
+          (await SharedPreferences.getInstance()).setBool('in_browser', false);
+          if (mounted) Navigator.pop(context);
         }
       },
       child: Scaffold(
@@ -610,7 +751,10 @@ class _BrowserState extends State<Browser> {
             ? const Center(child: CircularProgressIndicator())
             : Stack(children: [
                 IndexedStack(index: cur, children: [
-                  for (final tb in tabs) KeyedSubtree(key: ValueKey(tb.id), child: _webview(tb)),
+                  for (final tb in tabs)
+                    tb.loaded
+                        ? KeyedSubtree(key: ValueKey(tb.id), child: _webview(tb))
+                        : const SizedBox.shrink(),
                 ]),
                 Positioned(
                   bottom: 16,
