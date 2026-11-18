@@ -19,10 +19,11 @@ jobs:
         run: |
           flutter create --platforms=android --org com.castplayer --project-name castplayer /tmp/app
           cp main.dart dlna.dart browser.dart /tmp/app/lib/
-          cp pubspec.yaml /tmp/app/pubspec.yaml
+          cp pubspec.yaml patch_android.py /tmp/app/
           cd /tmp/app
           M=android/app/src/main/AndroidManifest.xml
           sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/><uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/><uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/><application android:usesCleartextTraffic="true"#' $M
+          python3 patch_android.py
           for f in android/app/build.gradle.kts android/app/build.gradle; do
             if [ -f "$f" ]; then
               if [[ "$f" == *.kts ]]; then
