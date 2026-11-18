@@ -25,14 +25,14 @@ jobs:
           for f in android/app/build.gradle.kts android/app/build.gradle; do
             if [ -f "$f" ]; then
               if [[ "$f" == *.kts ]]; then
-                printf '\nandroid {\n    lint {\n        checkReleaseBuilds = false\n        abortOnError = false\n    }\n}\n' >> "$f"
+                printf '\nandroid {\n    lint {\n        checkReleaseBuilds = false\n        abortOnError = false\n    }\n    buildTypes {\n        release {\n            isMinifyEnabled = false\n            isShrinkResources = false\n        }\n    }\n}\n' >> "$f"
               else
-                printf '\nandroid {\n    lintOptions {\n        checkReleaseBuilds false\n        abortOnError false\n    }\n}\n' >> "$f"
+                printf '\nandroid {\n    lintOptions {\n        checkReleaseBuilds false\n        abortOnError false\n    }\n    buildTypes {\n        release {\n            minifyEnabled false\n            shrinkResources false\n        }\n    }\n}\n' >> "$f"
               fi
             fi
           done
           flutter pub get
-          flutter build apk --release --no-shrink
+          flutter build apk --release
       - uses: actions/upload-artifact@v4
         with:
           name: castplayer-apk
