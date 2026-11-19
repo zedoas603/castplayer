@@ -10,6 +10,8 @@ void main() => runApp(const CastApp());
 
 const ar = {
   'title': 'كاست بلاير',
+  'proxyOpt': 'تمرير عبر الهاتف دائمًا (للروابط المحمية)',
+  'hintProxy': 'البث يمر عبر هذا الهاتف، فاترك التطبيق شغالًا. تقدر تستخدم الهاتف في أي شيء آخر.',
   'go': 'ابحث في جوجل أو اكتب رابط',
   'found': 'فيديوهات مكتشفة في الصفحة',
   'nofound': 'لم يتم اكتشاف فيديو بعد. شغّل الفيديو داخل الصفحة وانتظر لحظات.',
@@ -30,6 +32,8 @@ const ar = {
 };
 const en = {
   'title': 'CastPlayer',
+  'proxyOpt': 'Always stream through this phone (protected links)',
+  'hintProxy': 'Streaming passes through this phone, so keep the app running. You can still use the phone for other things.',
   'go': 'Search Google or enter URL',
   'found': 'Videos found on this page',
   'nofound': 'No video detected yet. Play the video in the page and wait a moment.',
@@ -171,7 +175,17 @@ class _HomeState extends State<Home> {
         context: context, builder: (_) => DevicePicker(t: widget.t));
     if (r == null || !mounted) return;
     try {
-      await Dlna.cast(r, url, name);
+      final prefs = await SharedPreferences.getInstance();
+      if (prefs.getBool('force_proxy') ?? false) {
+        await Dlna.cast(r, url, name, viaProxy: true);
+      } else {
+        try {
+          await Dlna.cast(r, url, name);
+          Proxy.active = false;
+        } catch (_) {
+          await Dlna.cast(r, url, name, viaProxy: true);
+        }
+      }
       if (!mounted) return;
       Navigator.push(context,
           MaterialPageRoute(builder: (_) => Remote(t: widget.t, r: r, title: name)));
@@ -225,10 +239,14 @@ class DevicePicker extends StatefulWidget {
 
 class _DevicePickerState extends State<DevicePicker> {
   List<Renderer>? devices;
+  bool force = false;
 
   @override
   void initState() {
     super.initState();
+    SharedPreferences.getInstance().then((p) {
+      if (mounted) setState(() => force = p.getBool('force_proxy') ?? false);
+    });
     _scan();
   }
 
@@ -249,6 +267,15 @@ class _DevicePickerState extends State<DevicePicker> {
         ListTile(
           title: Text(t['pick']!, style: const TextStyle(fontWeight: FontWeight.bold)),
           trailing: IconButton(icon: const Icon(Icons.refresh), onPressed: _scan),
+        ),
+        CheckboxListTile(
+          dense: true,
+          value: force,
+          title: Text(t['proxyOpt'] ?? ''),
+          onChanged: (v) async {
+            setState(() => force = v ?? false);
+            (await SharedPreferences.getInstance()).setBool('force_proxy', force);
+          },
         ),
         if (devices == null)
           Padding(
@@ -323,7 +350,7 @@ class _RemoteState extends State<Remote> {
         child: Column(children: [
           Text(widget.title, style: const TextStyle(fontSize: 18), textAlign: TextAlign.center),
           const SizedBox(height: 8),
-          Text(t['hint']!, style: const TextStyle(color: Colors.white54), textAlign: TextAlign.center),
+          Text(Proxy.active ? t['hintProxy']! : t['hint']!, style: const TextStyle(color: Colors.white54), textAlign: TextAlign.center),
           const Spacer(),
           Slider(
             value: dur == 0 ? 0 : pos.clamp(0, dur).toDouble(),
@@ -351,6 +378,7 @@ class _RemoteState extends State<Remote> {
                 icon: const Icon(Icons.stop_circle),
                 onPressed: () async {
                   await _do(() => Dlna.stop(widget.r));
+                  Proxy.stop();
                   if (mounted) Navigator.pop(context);
                 }),
           ]),

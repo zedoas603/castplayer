@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'dlna.dart';
 
 // ---------------------------------------------------------------------------
 // AdGuard DNS filter: downloaded once, cached 3 days, used to block requests.
@@ -314,6 +315,43 @@ class _BrowserState extends State<Browser> with WidgetsBindingObserver {
               forMainFrameOnly: false),
       ];
 
+  /// Headers the site expects (Referer, Origin, Cookie...), used by the phone proxy.
+  Map<String, String> _hdrFrom(_Tab tb, Map<String, String>? rh) {
+    final h = <String, String>{'User-Agent': _ua};
+    if (rh != null) {
+      for (final e in rh.entries) {
+        switch (e.key.toLowerCase()) {
+          case 'referer':
+            h['Referer'] = e.value;
+            break;
+          case 'origin':
+            h['Origin'] = e.value;
+            break;
+          case 'user-agent':
+            h['User-Agent'] = e.value;
+            break;
+          case 'cookie':
+            h['Cookie'] = e.value;
+            break;
+          case 'authorization':
+            h['Authorization'] = e.value;
+            break;
+        }
+      }
+    }
+    if (!h.containsKey('Referer') && tb.url.startsWith('http')) h['Referer'] = tb.url;
+    return h;
+  }
+
+  Future<void> _addCookie(String u) async {
+    try {
+      final cs = await CookieManager.instance().getCookies(url: WebUri(u));
+      if (cs.isNotEmpty) {
+        Proxy.addCookie(u, cs.map((c) => '${c.name}=${c.value}').join('; '));
+      }
+    } catch (_) {}
+  }
+
   String _dur(double sec) {
     final m = sec ~/ 60, x = sec.toInt() % 60;
     final h = m ~/ 60;
@@ -327,7 +365,7 @@ class _BrowserState extends State<Browser> with WidgetsBindingObserver {
     try {
       if (lu.contains('.m3u8')) {
         final r = await http
-            .get(Uri.parse(u), headers: {'User-Agent': _ua})
+            .get(Uri.parse(u), headers: Proxy.headersFor(u) ?? {'User-Agent': _ua})
             .timeout(const Duration(seconds: 6));
         if (r.statusCode != 200) return _Meta('', 3);
         final b = r.body;
@@ -345,7 +383,7 @@ class _BrowserState extends State<Browser> with WidgetsBindingObserver {
       }
       if (RegExp(r'\.(mp4|webm|mkv)').hasMatch(lu)) {
         final r = await http
-            .head(Uri.parse(u), headers: {'User-Agent': _ua})
+            .head(Uri.parse(u), headers: Proxy.headersFor(u) ?? {'User-Agent': _ua})
             .timeout(const Duration(seconds: 6));
         final len = int.tryParse(r.headers['content-length'] ?? '');
         if (r.statusCode < 400 && len != null && len < 3 * 1024 * 1024) return null;
@@ -560,7 +598,14 @@ class _BrowserState extends State<Browser> with WidgetsBindingObserver {
         ctl.addJavaScriptHandler(
             handlerName: 'sniff',
             callback: (args) {
-              if (args.isNotEmpty) _addFound(tb, args[0].toString());
+              if (args.isNotEmpty) {
+                final u = args[0].toString();
+                if (Proxy.headersFor(u) == null) {
+                  Proxy.remember(u, _hdrFrom(tb, null));
+                  _addCookie(u);
+                }
+                _addFound(tb, u);
+              }
               return null;
             });
         ctl.addJavaScriptHandler(
@@ -605,7 +650,11 @@ class _BrowserState extends State<Browser> with WidgetsBindingObserver {
               contentType: u.contains('.js') ? 'application/javascript' : 'text/plain',
               data: Uint8List(0));
         }
-        if (_media.hasMatch(u)) _addFound(tb, u);
+        if (_media.hasMatch(u)) {
+          Proxy.remember(u, _hdrFrom(tb, req.headers));
+          _addCookie(u);
+          _addFound(tb, u);
+        }
         return null;
       },
       onLoadStart: (ctl, url) {

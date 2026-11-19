@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 
 const _av = 'urn:schemas-upnp-org:service:AVTransport:1';
@@ -157,13 +158,19 @@ class Dlna {
       '<res protocolInfo="$protocolInfo">${esc(url)}</res></item></DIDL-Lite>';
 
   /// Tries several combinations (metadata variants, https->http) until the TV accepts.
-  static Future<void> cast(Renderer r, String url, String title) async {
+  static Future<void> cast(Renderer r, String url, String title,
+      {bool viaProxy = false}) async {
     try {
       await _soap(r.avUrl!, _av, 'Stop', '<InstanceID>0</InstanceID>');
     } catch (_) {}
-    final urls = <String>[url];
-    if (url.startsWith('https://')) urls.add('http://${url.substring(8)}');
+    final urls = <String>[];
     final mime = _mimeFor(url);
+    if (viaProxy) {
+      urls.add(await Proxy.urlFor(url, Uri.parse(r.avUrl!).host));
+    } else {
+      urls.add(url);
+      if (url.startsWith('https://')) urls.add('http://${url.substring(8)}');
+    }
     DlnaError? first;
     Object? last;
     for (final u in urls) {
@@ -221,5 +228,195 @@ class Dlna {
     final pos = RegExp(r'<RelTime>(.*?)</RelTime>').firstMatch(x)?.group(1) ?? '0:00:00';
     final dur = RegExp(r'<TrackDuration>(.*?)</TrackDuration>').firstMatch(x)?.group(1) ?? '0:00:00';
     return [_secs(pos), _secs(dur)];
+  }
+}
+
+
+class _Target {
+  final String url;
+  final Map<String, String> headers;
+  _Target(this.url, this.headers);
+}
+
+/// Local HTTP proxy on the phone: the TV fetches the video from the phone,
+/// and the phone fetches it from the source with the headers the site needs.
+class Proxy {
+  static HttpServer? _server;
+  static bool active = false;
+  static String _origin = '';
+  static int _n = 0;
+  static const _ch = MethodChannel('castplayer/intent');
+  static const _defaultUa =
+      'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
+  static final Map<String, Map<String, String>> _remembered = {};
+  static final Map<String, _Target> _targets = {};
+  static final Map<String, String> _idOf = {};
+  static final HttpClient _client = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 15)
+    ..autoUncompress = false
+    ..badCertificateCallback = (c, h, p) => true;
+
+  static void remember(String url, Map<String, String> headers) {
+    if (_remembered.length > 300) _remembered.remove(_remembered.keys.first);
+    _remembered[url] = headers;
+  }
+
+  static Map<String, String>? headersFor(String url) => _remembered[url];
+
+  static void addCookie(String url, String cookie) {
+    final h = _remembered[url];
+    if (h != null && cookie.isNotEmpty) h['Cookie'] = cookie;
+  }
+
+  static String _ext(String u) {
+    final segs = Uri.tryParse(u)?.pathSegments ?? const <String>[];
+    if (segs.isEmpty) return '';
+    return RegExp(r'\.[A-Za-z0-9]{2,5}$').firstMatch(segs.last)?.group(0) ?? '';
+  }
+
+  static String _idFor(String url, Map<String, String> h) {
+    final ex = _idOf[url];
+    if (ex != null) {
+      _targets[ex] = _Target(url, h);
+      return ex;
+    }
+    final id = (_n++).toRadixString(36);
+    _idOf[url] = id;
+    _targets[id] = _Target(url, h);
+    if (_targets.length > 4000) {
+      final k = _targets.keys.first;
+      _idOf.remove(_targets[k]!.url);
+      _targets.remove(k);
+    }
+    return id;
+  }
+
+  static String _wrap(String abs, Map<String, String> h) =>
+      '$_origin/s/${_idFor(abs, h)}${_ext(abs)}';
+
+  static Future<String> _lanIp(String tvHost) async {
+    final ifs = await NetworkInterface.list(
+        type: InternetAddressType.IPv4, includeLoopback: false);
+    final pre = tvHost.split('.').take(3).join('.');
+    String? fallback;
+    for (final i in ifs) {
+      for (final a in i.addresses) {
+        if (a.address.startsWith('$pre.')) return a.address;
+        fallback ??= a.address;
+      }
+    }
+    if (fallback != null) return fallback;
+    throw Exception('No Wi-Fi address found');
+  }
+
+  static Future<String> urlFor(String url, String tvHost) async {
+    var s = _server;
+    if (s == null) {
+      s = await HttpServer.bind(InternetAddress.anyIPv4, 0);
+      s.listen(_handle, onError: (_) {});
+      _server = s;
+    }
+    try {
+      await _ch.invokeMethod('startProxy');
+    } catch (_) {}
+    final ip = await _lanIp(tvHost);
+    _origin = 'http://$ip:${s.port}';
+    active = true;
+    final h = Map<String, String>.from(_remembered[url] ?? {'User-Agent': _defaultUa});
+    return _wrap(url, h);
+  }
+
+  static Future<void> stop() async {
+    active = false;
+    try {
+      await _ch.invokeMethod('stopProxy');
+    } catch (_) {}
+    try {
+      await _server?.close(force: true);
+    } catch (_) {}
+    _server = null;
+    _targets.clear();
+    _idOf.clear();
+  }
+
+  static String _rewrite(String body, Uri base, Map<String, String> h) {
+    final out = <String>[];
+    for (final raw in body.split('\n')) {
+      final l = raw.trimRight();
+      if (l.isEmpty) {
+        out.add(l);
+      } else if (l.startsWith('#')) {
+        out.add(l.replaceAllMapped(RegExp(r'URI="([^"]+)"'),
+            (m) => 'URI="${_wrap(base.resolve(m.group(1)!).toString(), h)}"'));
+      } else {
+        out.add(_wrap(base.resolve(l).toString(), h));
+      }
+    }
+    return out.join('\n');
+  }
+
+  static Future<void> _handle(HttpRequest req) async {
+    final res = req.response;
+    try {
+      final segs = req.uri.pathSegments;
+      if (segs.length < 2 || segs[0] != 's') {
+        res.statusCode = 404;
+        await res.close();
+        return;
+      }
+      final raw = segs[1];
+      final dot = raw.indexOf('.');
+      final t = _targets[dot < 0 ? raw : raw.substring(0, dot)];
+      if (t == null) {
+        res.statusCode = 404;
+        await res.close();
+        return;
+      }
+      final method = req.method == 'HEAD' ? 'HEAD' : 'GET';
+      final up = await _client.openUrl(method, Uri.parse(t.url));
+      t.headers.forEach((k, v) {
+        try {
+          up.headers.set(k, v);
+        } catch (_) {}
+      });
+      up.headers.set('Accept-Encoding', 'identity');
+      final range = req.headers.value('range');
+      if (range != null) up.headers.set('Range', range);
+      final resp = await up.close();
+      final ct = resp.headers.contentType?.mimeType ?? '';
+      final isM3u8 = t.url.toLowerCase().contains('.m3u8') || ct.contains('mpegurl');
+      res.headers.set('Access-Control-Allow-Origin', '*');
+      res.headers.set('transferMode.dlna.org', 'Streaming');
+      if (isM3u8 && resp.statusCode == 200 && method == 'GET') {
+        final body = await utf8.decoder.bind(resp).join();
+        final bytes = utf8.encode(_rewrite(body, Uri.parse(t.url), t.headers));
+        res.statusCode = 200;
+        res.headers.contentType = ContentType('application', 'vnd.apple.mpegurl');
+        res.contentLength = bytes.length;
+        res.add(bytes);
+        await res.close();
+        return;
+      }
+      res.statusCode = resp.statusCode;
+      for (final h in ['content-type', 'content-range', 'accept-ranges', 'last-modified', 'etag']) {
+        final v = resp.headers.value(h);
+        if (v != null) res.headers.set(h, v);
+      }
+      if (resp.headers.value('accept-ranges') == null) {
+        res.headers.set('accept-ranges', 'bytes');
+      }
+      if (resp.contentLength >= 0) res.contentLength = resp.contentLength;
+      if (method == 'GET') {
+        await res.addStream(resp);
+      } else {
+        await resp.drain();
+      }
+      await res.close();
+    } catch (_) {
+      try {
+        res.statusCode = 502;
+        await res.close();
+      } catch (_) {}
+    }
   }
 }
